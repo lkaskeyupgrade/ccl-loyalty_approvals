@@ -1,0 +1,182 @@
+-- ============================================================================
+-- Loyalty Credit — BNPL applications / decisions / orders pipeline
+-- Date filter throughout: application/decision create_date >= '2026-04-01'
+--                         and < '2026-08-01' (i.e. Apr 1 – Jul 31, 2026)
+--
+-- RUN ORDER MATTERS. tmp_da_v1 (block 3) reads from both tmp_apps (block 1)
+-- and tmp_app_credit_char (block 2) via joins, so both must be created first.
+-- Running this script top-to-bottom in a single pass satisfies that.
+-- ============================================================================
+
+
+-- ----------------------------------------------------------------------------
+-- 1) tmp_apps
+-- One row per application. Derives two status flags from the latest credit
+-- decision per loan_app_id:
+--   app_status    = 'APPROVED' when the application's own status already
+--                    signals approval (OFFERED / ISSUED / etc.) OR the most
+--                    recent decision result was APPROVED.
+--   issued_status = 'ISSUED' when the application status itself is ISSUED.
+-- Filtered to program = 'BNPL', the date window above, and upcode
+-- 'UP-20956569-7' only.
+-- ----------------------------------------------------------------------------
+create or replace table commercial_analytics.commercial_analytics.tmp_apps as 
+with latest_decision_dups as (
+       -- Pull every credit decision per application, tag each with its rank
+       -- (1 = most recent) so we can collapse to a single row per loan_app_id
+       -- below. Restricted to decisions that actually resulted in APPROVED.
+       select  
+              da.loan_app_id
+              ,da.create_date
+              ,cd.result
+              ,cd.update_date
+              ,row_number() OVER (PARTITION BY loan_app_id order by cd.update_date desc) AS loan_app_id_count
+              from decisioning.application da left join decisioning.credit_decision cd on da.id = cd.application_id
+              where 1=1
+              and program = 'BNPL'
+             and da.create_date >= '2026-04-01' and da.create_date < '2026-08-01'
+             and cd.result = 'APPROVED' 
+              --and da.create_date >= date_sub(current_date(), 30)
+             )
+              
+
+,latest_decision AS (
+    
+            -- Keep only the single most recent APPROVED decision per
+            -- loan_app_id (loan_app_id_count = 1 from the row_number above).
+            select 
+              loan_app_id
+              ,create_date
+              ,result
+              ,update_date as latest_decision_date
+            from latest_decision_dups
+            where loan_app_id_count = 1)
+ 
+
+
+
+--create or replace table commercial_analytics.commercial_analytics.tmp_apps as 
+select aps.application_id
+        ,application_create_date
+        ,applicant_id
+        ,uplift_upcode
+        ,ld.loan_app_id
+        ,status
+        ,uplift_order_id
+        -- app_status: APPROVED if the application's own status already implies
+        -- approval, or if it has a matching APPROVED decision in latest_decision.
+        ,case 
+              when aps.status  ='OFFERED' 
+              or (aps.status = 'EXPIRED' and ld.result = 'APPROVED') 
+              or (aps.status = 'READY_TO_AUTH' and ld.result = 'APPROVED') 
+              or (aps.status = 'PRE_QUALIFIED' and ld.result = 'APPROVED')
+              or (aps.status = 'ISSUED' and ld.result = 'APPROVED')
+              or ld.result = 'APPROVED'
+              then 'APPROVED' end as app_status
+
+        -- issued_status: ISSUED only when the application status itself is ISSUED.
+        ,case when aps.status = 'ISSUED' then 'ISSUED' end as issued_status
+        from databrickstors_canalytics_catalog.dw_bnpl.applications aps left join latest_decision ld on aps.application_id = ld.loan_app_id 
+        where 1=1
+        and application_create_date >= '2026-04-01'and application_create_date < '2026-08-01' and uplift_upcode = 'UP-20956569-7';
+
+
+-- ----------------------------------------------------------------------------
+-- 2) tmp_app_credit_char
+-- One row per applicant/loan_app_id: the FICO score pulled at credit-check
+-- time. Joined into tmp_da_v1 below as "acc" to attach fico to each
+-- application. Filtered to the same Apr 1 – Jul 31, 2026 window, keyed off
+-- upflow_create_time instead of application_create_date.
+-- ----------------------------------------------------------------------------
+create or replace table commercial_analytics.commercial_analytics.tmp_app_credit_char
+select applicant_id
+        ,loan_app_id
+        ,fico_score as fico
+        from core.applicant_credit_char_bnpl
+        where 1=1
+        and  upflow_create_time >= '2026-04-01'and upflow_create_time < '2026-08-01' ;
+
+        
+
+-- ----------------------------------------------------------------------------
+-- 3) tmp_da_v1
+-- The main detail/analytics table: one row per application, enriched with
+-- fico, fprm1_score, order/travel details pulled out of the credit decision's
+-- extended_attributes_json, and the risk-band flag (fico_fprm1_range_valid).
+--
+-- Depends on tmp_apps (1) and tmp_app_credit_char (2) — both created above —
+-- plus tmp_credit_decision, tmp_fprm_score, and dw_orders, which are assumed
+-- to already exist elsewhere in the pipeline.
+-- ----------------------------------------------------------------------------
+create or replace table commercial_analytics.commercial_analytics.tmp_da_v1 as 
+select cd.cd_id as loan_app_id
+        ,o.order_request_id
+        ,aps.status
+        ,aps.uplift_upcode        
+        ,aps.application_id
+        ,aps.application_create_date
+        ,cd.cd_id as last_credit_decision_id
+        --,program
+        ,cd.decision_type
+        
+        ,acc.fico
+        ,f.fprm1_score
+        -- Pull the first travel/order date out of whichever reservation type
+        -- is present on this order (hotel, air, cruise, pass, rental, event).
+        , get_json_object(cd.extended_attributes_json, '$.bnplAttributes.orderDetails.hotelReservations[0].startDate')                        as ht1StartDate
+  , get_json_object(cd.extended_attributes_json, '$.bnplAttributes.orderDetails.hotelReservations[0].propertyCode')                      as ht1PropertyCode
+  , get_json_object(cd.extended_attributes_json, '$.bnplAttributes.orderDetails.airReservations[0].itinerary[0].departureTime')          as air1Seg1departureTime
+  , get_json_object(cd.extended_attributes_json, '$.bnplAttributes.orderDetails.cruiseReservations[0].itinerary[0].departureDate')       as cr1Seg1DepartureDate
+  , get_json_object(cd.extended_attributes_json, '$.bnplAttributes.orderDetails.passesSubscriptions[0].activeDate')                       as pass1ActiveDate
+  , get_json_object(cd.extended_attributes_json, '$.bnplAttributes.orderDetails.rentals[0].startDate')                                    as rnt1StartDate
+  , get_json_object(cd.extended_attributes_json, '$.bnplAttributes.orderDetails.eventTickets[0].startDate')                              as evt1StartDate
+  , lower(get_json_object(cd.extended_attributes_json, '$.bnplAttributes.orderDetails.industry'))                                        as order_industry
+  , lower(get_json_object(cd.extended_attributes_json, '$.bnplAttributes.orderDetails.scoringContext'))                                  as scoring_context
+-- travel_date: earliest non-null date across all six reservation types above.
+, to_date(least(
+      case when air1Seg1departureTime = '' then null else air1Seg1departureTime end,
+      case when ht1StartDate = '' then null else ht1StartDate end,
+      case when cr1Seg1DepartureDate = '' then null else cr1Seg1DepartureDate end,
+      case when evt1StartDate = '' then null else evt1StartDate end,
+      case when rnt1StartDate = '' then null else rnt1StartDate end,
+      case when pass1ActiveDate = '' then null else pass1ActiveDate end
+  ), 'yyyy-MM-dd')                                                          as travel_date
+    -- adv_purchase_in_days: days between the credit decision and travel_date.
+    , datediff(DAY, cd.cd_create_date, travel_date)                                    as adv_purchase_in_days
+    -- ttt_range_valid: true when that gap is under the 120-day advance-window cutoff.
+    ,datediff(DAY, cd.cd_create_date, travel_date)  < 120 as ttt_range_valid
+-- fico_fprm1_range_valid ("risk band" flag): true when advance window < 120 days
+-- AND the fico/fprm1_score pair falls in one of the flagged bands below.
+-- NOTE: the first three WHEN clauses (fico > 780/740/700) all pair with the
+-- same fprm1_score range [0.26, 0.28), so they collapse to "fico > 700" in
+-- practice — CASE returns on first match regardless. Same pattern for the
+-- next two (fico > 660/620) and the last two (fico > 580/540).
+,CASE
+    WHEN datediff(DAY, cd.cd_create_date, travel_date)  < 120 and acc.fico > 780 AND fprm1_score < 0.28 AND fprm1_score >= 0.26 THEN TRUE
+    WHEN datediff(DAY, cd.cd_create_date, travel_date)  < 120 and acc.fico > 740 AND fprm1_score < 0.28 AND fprm1_score >= 0.26 THEN TRUE
+    WHEN datediff(DAY, cd.cd_create_date, travel_date)  < 120 and acc.fico > 700 AND fprm1_score < 0.28 AND fprm1_score >= 0.26 THEN TRUE
+    WHEN datediff(DAY, cd.cd_create_date, travel_date)  < 120 and acc.fico > 660 AND fprm1_score < 0.31 AND fprm1_score >= 0.29 THEN TRUE
+    WHEN datediff(DAY, cd.cd_create_date, travel_date)  < 120 and acc.fico > 620 AND fprm1_score < 0.31 AND fprm1_score >= 0.29 THEN TRUE
+    WHEN datediff(DAY, cd.cd_create_date, travel_date)  < 120 and acc.fico > 580 AND fprm1_score < 0.34 AND fprm1_score >= 0.32 THEN TRUE
+    WHEN datediff(DAY, cd.cd_create_date, travel_date)  < 120 and acc.fico > 540 AND fprm1_score < 0.34 AND fprm1_score >= 0.32 THEN TRUE
+    ELSE FALSE
+    END as fico_fprm1_range_valid
+    ,o.adv_booking
+    ,o.order_amount
+
+    -- tmp_apps (block 1) must already exist for this join to succeed.
+    from commercial_analytics.commercial_analytics.tmp_apps aps
+   -- join databrickstors_canalytics_catalog.decisioning.application a on a.loan_app_id = aps.application_id
+
+       left join commercial_analytics.commercial_analytics.tmp_credit_decision cd on aps.application_id = cd.cd_id
+
+        left join commercial_analytics.commercial_analytics.tmp_fprm_score f on cd.cd_id = f.credit_decision_id
+
+        -- tmp_app_credit_char (block 2) must already exist for this join to succeed.
+        left join commercial_analytics.commercial_analytics.tmp_app_credit_char acc on aps.application_id = acc.loan_app_id
+
+        left join commercial_analytics.commercial_analytics.dw_orders o on aps.uplift_order_id = o.uplift_order_id
+    where 1=1
+    --and program = 'BNPL'
+    --and application_create_date >= '2026-05-09'
+    --and uplift_upcode = 'UP-20956569-7'
